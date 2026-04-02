@@ -197,7 +197,7 @@ class CraigslistScraper(BaseScraper):
 
         # Extract price
         price = None
-        price_el = row.select_one(".priceinfo") or row.select_one(".result-price")
+        price_el = row.select_one("div.price") or row.select_one(".priceinfo") or row.select_one(".result-price")
         if price_el:
             price_text = price_el.get_text(strip=True)
             price_match = PRICE_PATTERN.search(price_text)
@@ -224,7 +224,7 @@ class CraigslistScraper(BaseScraper):
 
         # Extract location/neighborhood
         address = None
-        location_el = row.select_one(".result-hood") or row.select_one(".meta")
+        location_el = row.select_one("div.location") or row.select_one(".result-hood") or row.select_one(".meta")
         if location_el:
             address = location_el.get_text(strip=True).strip("() ")
 

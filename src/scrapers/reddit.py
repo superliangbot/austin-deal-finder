@@ -95,7 +95,6 @@ class RedditScraper(BaseScraper):
             timeout=httpx.Timeout(30.0, connect=10.0),
             headers={
                 "User-Agent": self.user_agent,
-                "Accept": "application/json",
             },
             follow_redirects=True,
         )
@@ -140,7 +139,7 @@ class RedditScraper(BaseScraper):
         return listings
 
     def _fetch_new_posts(self, subreddit_name: str) -> list[dict]:
-        """Fetch newest posts from a subreddit.
+        """Fetch newest posts from a subreddit via PullPush API.
 
         Args:
             subreddit_name: Name of the subreddit (without r/ prefix).
@@ -148,12 +147,17 @@ class RedditScraper(BaseScraper):
         Returns:
             List of normalized listing dicts from new posts.
         """
-        url = f"https://www.reddit.com/r/{subreddit_name}/new.json"
-        params = {"limit": "100"}
+        url = "https://api.pullpush.io/reddit/search/submission/"
+        params = {
+            "subreddit": subreddit_name,
+            "size": 100,
+            "sort": "desc",
+            "sort_type": "created_utc",
+        }
         return self._fetch_and_parse(url, params, subreddit_name)
 
     def _search_subreddit(self, subreddit_name: str, query: str) -> list[dict]:
-        """Search a single subreddit for housing posts.
+        """Search a single subreddit for housing posts via PullPush API.
 
         Args:
             subreddit_name: Name of the subreddit (without r/ prefix).
@@ -162,23 +166,23 @@ class RedditScraper(BaseScraper):
         Returns:
             List of normalized listing dicts from matching posts.
         """
-        url = f"https://www.reddit.com/r/{subreddit_name}/search.json"
+        url = "https://api.pullpush.io/reddit/search/submission/"
         params = {
+            "subreddit": subreddit_name,
             "q": query,
-            "sort": "new",
-            "t": "week",
-            "limit": "50",
-            "restrict_sr": "on",
+            "size": 50,
+            "sort": "desc",
+            "sort_type": "created_utc",
         }
         return self._fetch_and_parse(url, params, subreddit_name)
 
     def _fetch_and_parse(
         self, url: str, params: dict, subreddit_name: str
     ) -> list[dict]:
-        """Fetch a Reddit JSON endpoint and parse the posts.
+        """Fetch a PullPush API endpoint and parse the posts.
 
         Args:
-            url: Reddit JSON endpoint URL.
+            url: PullPush API endpoint URL.
             params: Query parameters.
             subreddit_name: Subreddit name for context.
 
@@ -206,9 +210,9 @@ class RedditScraper(BaseScraper):
             logger.exception("Failed to parse JSON from %s", url)
             return results
 
-        children = data.get("data", {}).get("children", [])
-        for child in children:
-            post_data = child.get("data", {})
+        # PullPush returns posts in data[] array (not wrapped in children[])
+        posts = data.get("data", [])
+        for post_data in posts:
             listing = self._parse_post(post_data, subreddit_name)
             if listing is not None:
                 results.append(listing)
@@ -256,6 +260,10 @@ class RedditScraper(BaseScraper):
 
             # Parse created timestamp
             created_utc = post.get("created_utc", 0)
+            try:
+                created_utc = float(created_utc)
+            except (TypeError, ValueError):
+                created_utc = 0
             created_dt = datetime.fromtimestamp(created_utc, tz=timezone.utc)
 
             # Collect image URLs if available

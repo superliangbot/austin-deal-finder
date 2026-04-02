@@ -1,9 +1,16 @@
 """Tests for scraper parsing logic using fixture data."""
 
+from unittest.mock import MagicMock, patch
+
 from bs4 import BeautifulSoup
 
 from src.scrapers.base import BaseScraper
 from src.scrapers.manual import ManualInput
+from src.scrapers.reddit import (
+    RedditScraper,
+    _detect_listing_type,
+    _extract_price,
+)
 from tests.conftest import FIXTURE_CRAIGSLIST_HTML, FIXTURE_FACEBOOK_PASTE
 
 
@@ -186,3 +193,159 @@ class TestManualInput:
         r1 = handler.from_facebook_paste(FIXTURE_FACEBOOK_PASTE)
         r2 = handler.from_facebook_paste(FIXTURE_FACEBOOK_PASTE)
         assert r1["source_id"] == r2["source_id"]
+
+
+class TestRedditPriceExtraction:
+    """Tests for Reddit price extraction helper."""
+
+    def test_extract_price_basic(self):
+        assert _extract_price("$1200") == 1200.0
+
+    def test_extract_price_with_comma(self):
+        assert _extract_price("$1,200") == 1200.0
+
+    def test_extract_price_with_mo_suffix(self):
+        assert _extract_price("$1,200/mo") == 1200.0
+
+    def test_extract_price_none_for_empty(self):
+        assert _extract_price("") is None
+
+    def test_extract_price_none_for_no_match(self):
+        assert _extract_price("no price here") is None
+
+    def test_extract_price_from_sentence(self):
+        assert _extract_price("Nice studio for $950/mo downtown") == 950.0
+
+
+class TestRedditListingTypeDetection:
+    """Tests for Reddit listing type detection."""
+
+    def test_detect_sublease(self):
+        assert _detect_listing_type("Sublease available ASAP") == "sublease"
+
+    def test_detect_sublet(self):
+        assert _detect_listing_type("Looking for a sublet") == "sublease"
+
+    def test_detect_lease_takeover(self):
+        assert _detect_listing_type("Lease takeover at the Vue") == "lease_takeover"
+
+    def test_detect_roommate(self):
+        assert _detect_listing_type("Roommate wanted in East Austin") == "roommate"
+
+    def test_detect_apartment(self):
+        assert _detect_listing_type("Studio apartment near UT") == "apartment"
+
+    def test_detect_none(self):
+        assert _detect_listing_type("This is a random post about Austin") is None
+
+
+class TestRedditScraperParsing:
+    """Tests for Reddit JSON post parsing."""
+
+    def _make_post_data(self, **overrides):
+        """Create a sample Reddit post JSON structure."""
+        post = {
+            "id": "abc123",
+            "title": "Sublease - Downtown Austin Studio $1,100/mo",
+            "selftext": "Furnished studio near Congress Ave. Available April 1.",
+            "author": "test_user",
+            "created_utc": 1711900000,
+            "score": 5,
+            "upvote_ratio": 0.9,
+            "num_comments": 3,
+            "permalink": "/r/AustinHousing/comments/abc123/sublease_downtown/",
+            "url": "https://www.reddit.com/r/AustinHousing/comments/abc123/sublease_downtown/",
+            "link_flair_text": "Housing",
+        }
+        post.update(overrides)
+        return post
+
+    def test_parse_post_returns_normalized_listing(self):
+        scraper = RedditScraper()
+        post = self._make_post_data()
+        result = scraper._parse_post(post, "AustinHousing")
+        assert result is not None
+        assert result["source"] == "reddit"
+        assert result["source_id"] == "abc123"
+        assert result["title"] == "Sublease - Downtown Austin Studio $1,100/mo"
+        assert result["price"] == 1100.0
+        assert result["listing_type"] == "sublease"
+        assert result["contact_info"] == "u/test_user"
+        assert "reddit.com" in result["source_url"]
+        scraper.close()
+
+    def test_parse_post_extracts_price_from_body(self):
+        scraper = RedditScraper()
+        post = self._make_post_data(
+            title="Room available downtown",
+            selftext="Nice room for $900/mo, utilities included.",
+        )
+        result = scraper._parse_post(post, "Austin")
+        assert result is not None
+        assert result["price"] == 900.0
+        scraper.close()
+
+    def test_parse_post_filters_irrelevant(self):
+        scraper = RedditScraper()
+        post = self._make_post_data(
+            title="Best tacos in Austin?",
+            selftext="Where can I get great tacos downtown?",
+        )
+        result = scraper._parse_post(post, "Austin")
+        assert result is None
+        scraper.close()
+
+    def test_parse_post_keeps_post_with_price_only(self):
+        scraper = RedditScraper()
+        post = self._make_post_data(
+            title="$1,500 downtown",
+            selftext="",
+        )
+        result = scraper._parse_post(post, "Austin")
+        assert result is not None
+        assert result["price"] == 1500.0
+        scraper.close()
+
+    def test_parse_post_image_extraction(self):
+        scraper = RedditScraper()
+        post = self._make_post_data(
+            url="https://i.redd.it/example.jpg",
+        )
+        result = scraper._parse_post(post, "AustinHousing")
+        assert result is not None
+        assert "https://i.redd.it/example.jpg" in result["images"]
+        scraper.close()
+
+    def test_parse_post_no_author(self):
+        scraper = RedditScraper()
+        post = self._make_post_data(author=None)
+        result = scraper._parse_post(post, "AustinHousing")
+        assert result is not None
+        assert result["contact_info"] is None
+        scraper.close()
+
+    @patch("src.scrapers.reddit.time.sleep")
+    def test_scrape_calls_endpoints(self, mock_sleep):
+        """Test that scrape() makes HTTP requests and deduplicates."""
+        scraper = RedditScraper()
+        fake_response = MagicMock()
+        fake_response.status_code = 200
+        fake_response.json.return_value = {
+            "data": {
+                "children": [
+                    {"data": self._make_post_data()},
+                    {"data": self._make_post_data(id="def456", title="Apartment near UT $1,400")},
+                ]
+            }
+        }
+        fake_response.raise_for_status = MagicMock()
+
+        with patch.object(scraper.http, "get", return_value=fake_response):
+            listings = scraper.scrape()
+
+        # Should deduplicate across subreddits and search terms
+        assert len(listings) == 2
+        ids = {l["source_id"] for l in listings}
+        assert "abc123" in ids
+        assert "def456" in ids
+        scraper.close()

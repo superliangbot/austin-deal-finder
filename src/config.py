@@ -5,13 +5,11 @@ from pydantic_settings import BaseSettings
 
 class Settings(BaseSettings):
     # Database
-    database_url: str = "postgresql+asyncpg://flywheel:flywheel_dev@localhost:5433/austin_deals"
-    database_url_sync: str = "postgresql://flywheel:flywheel_dev@localhost:5433/austin_deals"
+    database_url: str = "postgresql+asyncpg://dealfinder:dealfinder_dev@localhost:5435/austin_deals"
+    database_url_sync: str = "postgresql://dealfinder:dealfinder_dev@localhost:5435/austin_deals"
 
     # Reddit API
-    reddit_client_id: str = ""
-    reddit_client_secret: str = ""
-    reddit_user_agent: str = "AustinDealFinder/1.0"
+    reddit_user_agent: str = "AustinDealFinder/1.0 (housing search)"
 
     # OpenAI
     openai_api_key: str = ""

@@ -1,4 +1,4 @@
-"""Reddit scraper using PRAW (Python Reddit API Wrapper).
+"""Reddit scraper using public JSON endpoints.
 
 Searches housing-related subreddits for Austin area listings
 including subleases, apartments, roommate situations, and lease takeovers.
@@ -6,9 +6,10 @@ including subleases, apartments, roommate situations, and lease takeovers.
 
 import logging
 import re
+import time
 from datetime import datetime, timezone
 
-import praw
+import httpx
 
 from src.config import settings
 from src.scrapers.base import BaseScraper
@@ -30,6 +31,10 @@ SEARCH_TERMS = [
 
 # Regex to extract price from text (e.g., $1,200, $1200/mo, $950)
 PRICE_PATTERN = re.compile(r"\$[\d,]+(?:/mo)?")
+
+# Delay between requests to respect Reddit rate limits (2-3 seconds)
+REQUEST_DELAY_MIN = 2.0
+REQUEST_DELAY_MAX = 3.0
 
 
 def _extract_price(text: str) -> float | None:
@@ -77,7 +82,7 @@ def _detect_listing_type(text: str) -> str | None:
 
 
 class RedditScraper(BaseScraper):
-    """Scraper for Reddit housing posts using PRAW.
+    """Scraper for Reddit housing posts using public JSON endpoints.
 
     Searches multiple Austin-area subreddits for housing-related posts
     and extracts listing information from post titles and bodies.
@@ -85,17 +90,21 @@ class RedditScraper(BaseScraper):
 
     def __init__(self) -> None:
         super().__init__()
-        self.reddit = praw.Reddit(
-            client_id=settings.reddit_client_id,
-            client_secret=settings.reddit_client_secret,
-            user_agent=settings.reddit_user_agent,
+        self.user_agent = settings.reddit_user_agent
+        self.http = httpx.Client(
+            timeout=httpx.Timeout(30.0, connect=10.0),
+            headers={
+                "User-Agent": self.user_agent,
+                "Accept": "application/json",
+            },
+            follow_redirects=True,
         )
 
     def scrape(self) -> list[dict]:
         """Scrape housing listings from Reddit.
 
-        Iterates through configured subreddits and search terms,
-        collecting and normalizing relevant posts.
+        Fetches new posts and searches for housing terms across
+        configured subreddits.
 
         Returns:
             List of normalized listing dictionaries.
@@ -104,6 +113,17 @@ class RedditScraper(BaseScraper):
         seen_ids: set[str] = set()
 
         for subreddit_name in SUBREDDITS:
+            # Fetch new posts from the subreddit
+            try:
+                new_posts = self._fetch_new_posts(subreddit_name)
+                for listing in new_posts:
+                    if listing["source_id"] not in seen_ids:
+                        seen_ids.add(listing["source_id"])
+                        listings.append(listing)
+            except Exception:
+                logger.exception("Error fetching new posts from r/%s", subreddit_name)
+
+            # Search for each term
             for term in SEARCH_TERMS:
                 try:
                     results = self._search_subreddit(subreddit_name, term)
@@ -119,6 +139,19 @@ class RedditScraper(BaseScraper):
         logger.info("Reddit scraper found %d unique listings", len(listings))
         return listings
 
+    def _fetch_new_posts(self, subreddit_name: str) -> list[dict]:
+        """Fetch newest posts from a subreddit.
+
+        Args:
+            subreddit_name: Name of the subreddit (without r/ prefix).
+
+        Returns:
+            List of normalized listing dicts from new posts.
+        """
+        url = f"https://www.reddit.com/r/{subreddit_name}/new.json"
+        params = {"limit": "100"}
+        return self._fetch_and_parse(url, params, subreddit_name)
+
     def _search_subreddit(self, subreddit_name: str, query: str) -> list[dict]:
         """Search a single subreddit for housing posts.
 
@@ -129,41 +162,78 @@ class RedditScraper(BaseScraper):
         Returns:
             List of normalized listing dicts from matching posts.
         """
+        url = f"https://www.reddit.com/r/{subreddit_name}/search.json"
+        params = {
+            "q": query,
+            "sort": "new",
+            "t": "week",
+            "limit": "50",
+            "restrict_sr": "on",
+        }
+        return self._fetch_and_parse(url, params, subreddit_name)
+
+    def _fetch_and_parse(
+        self, url: str, params: dict, subreddit_name: str
+    ) -> list[dict]:
+        """Fetch a Reddit JSON endpoint and parse the posts.
+
+        Args:
+            url: Reddit JSON endpoint URL.
+            params: Query parameters.
+            subreddit_name: Subreddit name for context.
+
+        Returns:
+            List of normalized listing dicts.
+        """
         results: list[dict] = []
-        subreddit = self.reddit.subreddit(subreddit_name)
+
+        # Rate limit: wait between requests
+        time.sleep(
+            REQUEST_DELAY_MIN
+            + (REQUEST_DELAY_MAX - REQUEST_DELAY_MIN) * 0.5
+        )
 
         try:
-            # Search recent posts (limit to 50 per query to stay within rate limits)
-            for post in subreddit.search(query, sort="new", time_filter="week", limit=50):
-                listing = self._parse_post(post, subreddit_name)
-                if listing is not None:
-                    results.append(listing)
+            response = self.http.get(url, params=params)
+            response.raise_for_status()
+        except httpx.HTTPError:
+            logger.exception("HTTP error fetching %s", url)
+            return results
+
+        try:
+            data = response.json()
         except Exception:
-            logger.exception("Failed to search r/%s for '%s'", subreddit_name, query)
+            logger.exception("Failed to parse JSON from %s", url)
+            return results
+
+        children = data.get("data", {}).get("children", [])
+        for child in children:
+            post_data = child.get("data", {})
+            listing = self._parse_post(post_data, subreddit_name)
+            if listing is not None:
+                results.append(listing)
 
         return results
 
-    def _parse_post(self, post, subreddit_name: str) -> dict | None:
-        """Parse a Reddit post into a normalized listing dict.
+    def _parse_post(self, post: dict, subreddit_name: str) -> dict | None:
+        """Parse a Reddit post JSON object into a normalized listing dict.
 
         Args:
-            post: PRAW Submission object.
+            post: Post data dict from Reddit JSON API.
             subreddit_name: Name of the subreddit the post came from.
 
         Returns:
             Normalized listing dict, or None if the post is not relevant.
         """
         try:
-            title = post.title or ""
-            body = post.selftext or ""
+            title = post.get("title", "")
+            body = post.get("selftext", "")
             combined_text = f"{title} {body}"
 
             # Extract price from title first, then body
             price = _extract_price(title) or _extract_price(body)
 
             # Filter out posts that are clearly not listings
-            # (e.g., questions about housing market, complaints, etc.)
-            # Keep posts that have a price or housing-related keywords
             housing_keywords = [
                 "sublease", "sublet", "rent", "apartment", "room",
                 "lease", "housing", "bedroom", "studio", "br", "ba",
@@ -174,51 +244,57 @@ class RedditScraper(BaseScraper):
                 return None
 
             # Build the source URL
-            source_url = f"https://www.reddit.com{post.permalink}"
+            permalink = post.get("permalink", "")
+            source_url = f"https://www.reddit.com{permalink}" if permalink else None
 
             # Detect listing type
             listing_type = _detect_listing_type(combined_text)
 
             # Extract contact info from the post
-            contact_info = None
-            if post.author:
-                contact_info = f"u/{post.author.name}"
+            author = post.get("author")
+            contact_info = f"u/{author}" if author else None
 
             # Parse created timestamp
-            created_dt = datetime.fromtimestamp(post.created_utc, tz=timezone.utc)
+            created_utc = post.get("created_utc", 0)
+            created_dt = datetime.fromtimestamp(created_utc, tz=timezone.utc)
 
             # Collect image URLs if available
             images: list[str] = []
-            if hasattr(post, "preview") and post.preview:
+            preview = post.get("preview")
+            if preview:
                 try:
-                    for img in post.preview.get("images", []):
+                    for img in preview.get("images", []):
                         source_img = img.get("source", {})
                         if source_img.get("url"):
                             images.append(source_img["url"])
                 except (AttributeError, TypeError):
                     pass
-            if hasattr(post, "url") and post.url and any(
-                post.url.lower().endswith(ext) for ext in (".jpg", ".jpeg", ".png", ".gif")
+
+            post_url = post.get("url", "")
+            if post_url and any(
+                post_url.lower().endswith(ext) for ext in (".jpg", ".jpeg", ".png", ".gif")
             ):
-                images.append(post.url)
+                images.append(post_url)
+
+            post_id = post.get("id", "")
 
             raw_data = {
                 "subreddit": subreddit_name,
-                "author": str(post.author) if post.author else None,
-                "created_utc": post.created_utc,
+                "author": author,
+                "created_utc": created_utc,
                 "created_dt": created_dt.isoformat(),
-                "score": post.score,
-                "upvote_ratio": post.upvote_ratio,
-                "num_comments": post.num_comments,
-                "permalink": post.permalink,
+                "score": post.get("score", 0),
+                "upvote_ratio": post.get("upvote_ratio", 0),
+                "num_comments": post.get("num_comments", 0),
+                "permalink": permalink,
                 "selftext": body,
-                "url": post.url,
-                "flair": post.link_flair_text,
+                "url": post_url,
+                "flair": post.get("link_flair_text"),
             }
 
             return self.normalize_listing(
                 source="reddit",
-                source_id=post.id,
+                source_id=post_id,
                 source_url=source_url,
                 title=title,
                 description=body if body else None,
@@ -230,5 +306,12 @@ class RedditScraper(BaseScraper):
             )
 
         except Exception:
-            logger.exception("Error parsing Reddit post %s", getattr(post, "id", "unknown"))
+            logger.exception(
+                "Error parsing Reddit post %s", post.get("id", "unknown")
+            )
             return None
+
+    def close(self) -> None:
+        """Close HTTP clients."""
+        self.http.close()
+        super().close()

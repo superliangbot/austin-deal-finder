@@ -32,8 +32,6 @@ multidict==6.7.1
 openai==2.30.0
 packaging==26.0
 pluggy==1.6.0
-praw==7.8.1
-prawcore==2.4.0
 propcache==0.4.1
 psycopg2-binary==2.9.11
 pydantic==2.12.5

@@ -17,7 +17,14 @@ from src.scrapers.base import BaseScraper
 logger = logging.getLogger(__name__)
 
 # Subreddits to search for Austin housing posts
-SUBREDDITS = ["AustinHousing", "Austin", "UTAustin"]
+SUBREDDITS = [
+    "AustinHousing",
+    "Austin",
+    "UTAustin",
+    "austinjobs",       # people post housing alongside job searches
+    "Urbanism",         # Austin housing market discussions with deals info
+    "AustinClassifieds",
+]
 
 # Search terms for finding housing-related posts
 SEARCH_TERMS = [
@@ -27,6 +34,10 @@ SEARCH_TERMS = [
     "roommate",
     "lease takeover",
     "rent",
+    "new build",
+    "move-in special",
+    "free month",
+    "lease special",
 ]
 
 # Regex to extract price from text (e.g., $1,200, $1200/mo, $950)

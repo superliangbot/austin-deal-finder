@@ -1,11 +1,13 @@
-"""Geocoding and distance calculation utilities.
+"""Geocoding and distance calculation for listings.
 
-Uses OpenStreetMap Nominatim for geocoding and the haversine formula
-for computing distances between coordinates.
+Uses OpenStreetMap Nominatim for geocoding addresses to coordinates,
+OSRM for driving time, and walking speed estimation for walk times.
+All free, no API keys needed.
 """
 
 import logging
 import math
+import time
 
 import httpx
 
@@ -13,128 +15,240 @@ from src.config import settings
 
 logger = logging.getLogger(__name__)
 
-# Earth radius in miles
-_EARTH_RADIUS_MILES = 3959
+# Office location: 600 N Congress Ave, Austin, TX 78701
+OFFICE_LAT = 30.2694558
+OFFICE_LON = -97.7422904
+
+# Walking speed in mph (average human)
+WALK_SPEED_MPH = 3.0
+
+# Rate limiting for Nominatim (max 1 req/sec per their policy)
+_last_nominatim_call = 0.0
+
+NOMINATIM_URL = "https://nominatim.openstreetmap.org/search"
+OSRM_ROUTE_URL = "http://router.project-osrm.org/route/v1/driving"
+
+HEADERS = {"User-Agent": "AustinDealFinder/1.0 (housing search)"}
 
 
 def haversine_distance(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
-    """Return the great-circle distance in miles between two points on Earth.
+    """Calculate the great-circle distance between two points in miles.
 
-    Uses the haversine formula with Earth radius of 3959 miles.
+    Args:
+        lat1, lon1: First point coordinates.
+        lat2, lon2: Second point coordinates.
+
+    Returns:
+        Distance in miles.
     """
-    lat1_rad = math.radians(lat1)
-    lat2_rad = math.radians(lat2)
-    dlat = math.radians(lat2 - lat1)
-    dlon = math.radians(lon2 - lon1)
-
-    a = (
-        math.sin(dlat / 2) ** 2
-        + math.cos(lat1_rad) * math.cos(lat2_rad) * math.sin(dlon / 2) ** 2
-    )
-    c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
-
-    return _EARTH_RADIUS_MILES * c
-
-
-def estimate_walk_minutes(distance_miles: float) -> int:
-    """Estimate walking time in minutes for a given distance in miles.
-
-    Uses a rough factor of 20 minutes per mile (about 3 mph walking speed).
-    """
-    return round(distance_miles * 20)
+    R = 3958.8  # Earth radius in miles
+    lat1, lon1, lat2, lon2 = map(math.radians, [lat1, lon1, lat2, lon2])
+    dlat = lat2 - lat1
+    dlon = lon2 - lon1
+    a = math.sin(dlat / 2) ** 2 + math.cos(lat1) * math.cos(lat2) * math.sin(dlon / 2) ** 2
+    return R * 2 * math.asin(math.sqrt(a))
 
 
 def geocode_address(address: str) -> tuple[float, float] | None:
-    """Geocode an address string to (latitude, longitude) using Nominatim.
+    """Geocode an address string to (lat, lon) using Nominatim.
 
-    Returns ``None`` when the address cannot be resolved.
+    Respects Nominatim's 1 request/second rate limit.
+
+    Args:
+        address: Address or location string.
+
+    Returns:
+        (latitude, longitude) tuple, or None if geocoding fails.
     """
-    url = "https://nominatim.openstreetmap.org/search"
-    params = {
-        "q": address,
-        "format": "json",
-        "limit": 1,
-    }
-    headers = {
-        "User-Agent": "AustinDealFinder/1.0 (housing search tool)",
-    }
+    global _last_nominatim_call
+
+    if not address or len(address.strip()) < 3:
+        return None
+
+    # Rate limit: 1 req/sec for Nominatim
+    elapsed = time.time() - _last_nominatim_call
+    if elapsed < 1.1:
+        time.sleep(1.1 - elapsed)
+
+    # Append Austin, TX if not present to improve results
+    query = address.strip()
+    if "austin" not in query.lower() and "tx" not in query.lower():
+        query = f"{query}, Austin, TX"
 
     try:
-        with httpx.Client(timeout=10) as client:
-            response = client.get(url, params=params, headers=headers)
-            response.raise_for_status()
-            results = response.json()
+        _last_nominatim_call = time.time()
+        response = httpx.get(
+            NOMINATIM_URL,
+            params={"q": query, "format": "json", "limit": 1, "countrycodes": "us"},
+            headers=HEADERS,
+            timeout=10,
+        )
+        response.raise_for_status()
+        results = response.json()
 
-        if not results:
-            logger.warning("No geocoding results for address: %s", address)
-            return None
+        if results:
+            lat = float(results[0]["lat"])
+            lon = float(results[0]["lon"])
+            return (lat, lon)
 
-        lat = float(results[0]["lat"])
-        lon = float(results[0]["lon"])
-        logger.info("Geocoded '%s' to (%f, %f)", address, lat, lon)
-        return (lat, lon)
+    except Exception:
+        logger.debug("Geocoding failed for: %s", address)
 
-    except httpx.HTTPError as exc:
-        logger.error("HTTP error during geocoding for '%s': %s", address, exc)
-        return None
-    except (KeyError, IndexError, ValueError) as exc:
-        logger.error("Failed to parse geocoding response for '%s': %s", address, exc)
-        return None
+    return None
 
 
-def calculate_distance_from_target(lat: float, lon: float) -> float:
-    """Return the distance in miles from the configured target location.
+def get_driving_time(lat: float, lon: float) -> tuple[float, float] | None:
+    """Get driving distance and time from a point to the office using OSRM.
 
-    The default target is 600 Congress Ave, Austin, TX (30.2672, -97.7431).
+    Args:
+        lat: Latitude of the listing.
+        lon: Longitude of the listing.
+
+    Returns:
+        (distance_miles, duration_minutes) tuple, or None on error.
     """
-    return haversine_distance(settings.target_lat, settings.target_lon, lat, lon)
+    try:
+        url = f"{OSRM_ROUTE_URL}/{OFFICE_LON},{OFFICE_LAT};{lon},{lat}"
+        response = httpx.get(
+            url,
+            params={"overview": "false"},
+            timeout=10,
+        )
+        response.raise_for_status()
+        data = response.json()
+
+        if data.get("routes"):
+            route = data["routes"][0]
+            dist_miles = route["distance"] / 1609.34
+            duration_min = route["duration"] / 60
+            return (dist_miles, duration_min)
+
+    except Exception:
+        logger.debug("OSRM routing failed for (%s, %s)", lat, lon)
+
+    return None
 
 
-def enrich_listing_location(listing_data: dict) -> dict:
-    """Enrich a listing dict with location-derived fields.
+def estimate_walk_time(distance_miles: float) -> float:
+    """Estimate walking time in minutes from road distance.
 
-    If the listing already has ``lat`` and ``lon`` keys they are reused;
-    otherwise the ``address`` field is geocoded via Nominatim.
+    Args:
+        distance_miles: Road distance in miles.
 
-    Added / updated keys:
-    - ``lat``, ``lon`` (floats or None)
-    - ``distance_miles`` (float or None)
-    - ``walk_minutes`` (int or None)
+    Returns:
+        Estimated walking time in minutes.
     """
-    data = dict(listing_data)  # shallow copy to avoid mutating the original
+    return (distance_miles / WALK_SPEED_MPH) * 60
 
-    lat = data.get("lat")
-    lon = data.get("lon")
 
-    # Attempt geocoding when coordinates are missing
-    if lat is None or lon is None:
-        address = data.get("address")
-        if address:
-            coords = geocode_address(address)
-            if coords is not None:
-                lat, lon = coords
-                data["lat"] = lat
-                data["lon"] = lon
-            else:
-                logger.warning(
-                    "Could not geocode listing address: %s", address
-                )
-                data["distance_miles"] = None
-                data["walk_minutes"] = None
-                return data
+def enrich_listing_with_distance(listing: dict) -> dict:
+    """Add distance and travel time data to a listing.
+
+    Tries to geocode the address, then calculates:
+    - distance_miles (haversine)
+    - walk_minutes (estimated from road distance)
+    - drive_minutes (from OSRM)
+    - latitude/longitude
+
+    Args:
+        listing: Listing dict to enrich.
+
+    Returns:
+        The same listing dict with distance fields added.
+    """
+    address = listing.get("address") or ""
+    title = listing.get("title") or ""
+
+    coords = None
+
+    # Try geocoding the address
+    if address:
+        coords = geocode_address(address)
+
+    # Fallback: try geocoding from title (sometimes has location info)
+    if not coords and title:
+        # Extract location hints from title
+        for hint in _extract_location_hints(title):
+            coords = geocode_address(hint)
+            if coords:
+                break
+
+    if coords:
+        lat, lon = coords
+        listing["latitude"] = lat
+        listing["longitude"] = lon
+
+        # Haversine distance (straight line)
+        listing["distance_miles"] = round(haversine_distance(OFFICE_LAT, OFFICE_LON, lat, lon), 2)
+
+        # OSRM driving route
+        drive_result = get_driving_time(lat, lon)
+        if drive_result:
+            road_dist, drive_min = drive_result
+            listing["drive_minutes"] = round(drive_min, 0)
+            listing["road_distance_miles"] = round(road_dist, 2)
+            listing["walk_minutes"] = round(estimate_walk_time(road_dist), 0)
         else:
-            logger.warning("Listing has no address and no coordinates; skipping location enrichment")
-            data["distance_miles"] = None
-            data["walk_minutes"] = None
-            return data
+            # Fallback: estimate from haversine (multiply by 1.3 for road factor)
+            est_road = listing["distance_miles"] * 1.3
+            listing["walk_minutes"] = round(estimate_walk_time(est_road), 0)
+            listing["drive_minutes"] = round(est_road / 30 * 60, 0)  # assume 30mph avg
 
-    distance = calculate_distance_from_target(lat, lon)
-    data["distance_miles"] = round(distance, 2)
-    data["walk_minutes"] = estimate_walk_minutes(distance)
+    return listing
 
-    logger.info(
-        "Location enrichment complete: %.2f miles, ~%d min walk",
-        data["distance_miles"],
-        data["walk_minutes"],
-    )
-    return data
+
+def _extract_location_hints(text: str) -> list[str]:
+    """Extract potential location strings from text.
+
+    Looks for neighborhood names, street names, and zip codes.
+    """
+    hints = []
+    text_lower = text.lower()
+
+    # Known Austin neighborhoods
+    neighborhoods = [
+        "downtown", "west campus", "east austin", "south congress", "soco",
+        "rainey", "zilker", "barton hills", "travis heights", "south lamar",
+        "north loop", "hyde park", "mueller", "riverside", "bouldin",
+        "clarksville", "old west austin", "rosedale", "crestview",
+        "south austin", "north austin", "east side", "78701", "78702",
+        "78703", "78704", "78705",
+    ]
+
+    for n in neighborhoods:
+        if n in text_lower:
+            hints.append(f"{n}, Austin, TX")
+
+    return hints
+
+
+def is_within_walk(listing: dict, max_minutes: int = 30) -> bool:
+    """Check if listing is within walking distance.
+
+    Args:
+        listing: Enriched listing dict.
+        max_minutes: Maximum walk time in minutes.
+
+    Returns:
+        True if walkable within the time limit.
+    """
+    walk_min = listing.get("walk_minutes")
+    if walk_min is not None:
+        return walk_min <= max_minutes
+    return False
+
+
+def is_within_drive(listing: dict, max_minutes: int = 20) -> bool:
+    """Check if listing is within driving distance.
+
+    Args:
+        listing: Enriched listing dict.
+        max_minutes: Maximum drive time in minutes.
+
+    Returns:
+        True if driveable within the time limit.
+    """
+    drive_min = listing.get("drive_minutes")
+    if drive_min is not None:
+        return drive_min <= max_minutes
+    return False
